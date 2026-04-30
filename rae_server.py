@@ -26,6 +26,9 @@ from pathlib import Path
 
 import httpx
 from bs4 import BeautifulSoup
+import re
+
+
 
 # Se mantiene esta variable global en True para no afectar la respuesta del endpoint /health
 PYRAE_OK = True
@@ -90,7 +93,6 @@ class GenerarRequest(BaseModel):
 def scrape_rae(word: str) -> dict:
     url = f"https://dle.rae.es/{word.lower().strip()}"
     
-    # Simular ser un navegador Google Chrome en Windows para evitar bloqueos de la RAE
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -104,10 +106,8 @@ def scrape_rae(word: str) -> dict:
         if response.status_code != 200:
             return {"error": f"Bloqueo de red (HTTP {response.status_code})"}
             
-        # Parsear el HTML devuelto
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Buscar el contenedor principal de la palabra en el DOM
         article = soup.find("article")
         if not article:
             return {"error": "no encontrada"}
@@ -115,22 +115,19 @@ def scrape_rae(word: str) -> dict:
         defs = []
         gram = ""
         
-        # En el DLE, extraer las definiciones que se encuentran bajo las clases 'j' o 'm'
-        paragraphs = article.find_all("p", class_=["j", "m"])
+        # SOLUCIÓN: Buscar párrafos cuya clase empiece con 'j' o 'm' usando Expresiones Regulares
+        paragraphs = article.find_all("p", class_=re.compile(r"^[jm]"))
         
-        # Procesar únicamente las primeras 3 acepciones para optimizar la tarjeta de Anki
         for i, p in enumerate(paragraphs[:3]):
             abbr = p.find("abbr")
             if i == 0 and abbr:
                 gram = abbr.get("title", abbr.text)
                 
-            # Limpiar el texto: remover el número de acepción y las abreviaturas gramaticales
             for span in p.find_all("span", class_="n_acep"):
                 span.extract()
             for a in p.find_all("abbr"):
                 a.extract()
                 
-            # Extraer el texto final limpio
             definition_text = p.get_text(separator=" ", strip=True).replace(" ,", ",")
             
             if definition_text:
