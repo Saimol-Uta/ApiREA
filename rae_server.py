@@ -47,7 +47,7 @@ job_state: dict = {
     "finished_at": None,
 }
 
-# Headers que imitan un navegador real en Linux
+# Headers que imitan navegador Linux real
 RAE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -92,28 +92,29 @@ class GenerarRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# SCRAPING
+# SCRAPING — basado en estructura real del DLE (verificada con debug HTML)
+#
+# El DLE moderno usa esta estructura:
+#
+#   <ol class="c-definitions">
+#     <li id="..." class="j">                    ← acepción principal
+#       <div class="c-definitions__item" role="definition">
+#         <div>
+#           <abbr class="d" title="nombre femenino">f.</abbr>
+#           Pasividad, desinterés, falta de voluntad.
+#           <span class="h">ejemplo en cursiva</span>   ← ejemplo (si existe)
+#         </div>
+#       </div>
+#     </li>
+#     <li class="j2"> ... </li>                  ← acepciones secundarias
+#   </ol>
+#
+# La categoría gramatical está en <abbr class="d" title="nombre femenino">
+# Los ejemplos están en <span class="h"> (color morado en la web)
+# Los sinónimos están en <span class="sin"> (no los queremos en la definición)
 # ---------------------------------------------------------------------------
 
 def scrape_rae(word: str) -> dict:
-    """
-    Scrapea el DLE de la RAE con estrategia en capas.
-
-    El DLE usa párrafos <p> con clases como:
-        j   → definición principal
-        j1, j2, j3  → acepciones numeradas
-        m, m1, m2   → acepciones de locuciones / subentradas
-        p, p1       → otros tipos
-
-    Cada <p> suele contener:
-        <abbr>  → categoría gramatical (title="sustantivo masculino", etc.)
-        <span class="n_acep"> → número de acepción ("1.", "2.")
-        <span class="h">      → ejemplo de uso (en cursiva en la web)
-        texto directo         → la definición
-
-    Si falla cualquier estrategia, guarda el HTML en outputs/debug_<word>.html
-    para que puedas inspeccionarlo y ajustar.
-    """
     url = f"https://dle.rae.es/{word.lower().strip()}"
 
     try:
@@ -126,71 +127,66 @@ def scrape_rae(word: str) -> dict:
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # --- 1. Localizar el contenedor principal ---
-        article = (
-            soup.find("article")
-            or soup.find("div", id="resultados")
-            or soup.find("div", class_=re.compile(r"resultado"))
-            or soup.find("main")
-        )
-
-        if not article:
+        # --- 1. Buscar el <ol class="c-definitions"> principal ---
+        ol = soup.find("ol", class_="c-definitions")
+        if not ol:
             _save_debug(word, html)
-            return {"error": "contenedor principal no encontrado (HTML guardado para debug)"}
+            return {"error": "sin lista de definiciones (HTML guardado para debug)"}
 
         defs = []
         gram = ""
 
-        # --- 2a. Estrategia principal: clases j / m / p con número opcional ---
-        # Busca clases cuyo PRIMER token sea j, j1..j9, m, m1..m9, p, p1..p9
-        clase_def = re.compile(r'^[jmp]\d*$')
-        paragraphs = [
-            p for p in article.find_all("p")
-            if any(clase_def.match(c) for c in p.get("class", []))
-        ]
+        # --- 2. Iterar los <li class="j"> / <li class="j1"> / <li class="j2"> ---
+        # Clases de acepciones: j, j1, j2, j3 (principales), m (locuciones)
+        li_items = ol.find_all("li", class_=re.compile(r'^[jm]\d*$'))
 
-        # --- 2b. Fallback: <p> con atributo data-id (DLE moderno) ---
-        if not paragraphs:
-            paragraphs = article.find_all("p", attrs={"data-id": True})
+        # Fallback: cualquier <li> con role="definition" o div.c-definitions__item
+        if not li_items:
+            li_items = ol.find_all("li")
 
-        # --- 2c. Fallback: cualquier <p> con más de 25 caracteres ---
-        if not paragraphs:
-            paragraphs = [
-                p for p in article.find_all("p")
-                if len(p.get_text(strip=True)) > 25
-            ]
+        for i, li in enumerate(li_items[:3]):
+            # Buscar el div de contenido de la definición
+            def_div = li.find("div", attrs={"role": "definition"})
+            if not def_div:
+                def_div = li.find("div", class_="c-definitions__item")
+            if not def_div:
+                def_div = li  # fallback: usar el li directamente
 
-        if not paragraphs:
-            _save_debug(word, html)
-            return {"error": "sin párrafos de definición (HTML guardado para debug)"}
-
-        # --- 3. Extraer información de cada párrafo ---
-        for i, p in enumerate(paragraphs[:3]):
-            # Categoría gramatical: primer <abbr> del primer párrafo
+            # Extraer categoría gramatical del primer ítem
+            # <abbr class="d" title="nombre femenino">f.</abbr>
             if i == 0:
-                abbr = p.find("abbr")
-                if abbr:
-                    gram = abbr.get("title", abbr.get_text(strip=True))
+                abbr_gram = def_div.find("abbr", class_="d")
+                if abbr_gram:
+                    gram = abbr_gram.get("title", abbr_gram.get_text(strip=True))
 
             # Clonar para no mutilar el soup original
-            p_clone = BeautifulSoup(str(p), "html.parser").find("p")
+            work = BeautifulSoup(str(def_div), "html.parser")
 
-            # Extraer ejemplo antes de limpiar (span.h = cursiva = ejemplo en DLE)
+            # Extraer ejemplo antes de limpiar
+            # <span class="h"> = cursiva morada = ejemplo
             ejemplo = ""
-            for ex_tag in p_clone.find_all("span", class_=re.compile(r'\bh\b')):
-                ejemplo = ex_tag.get_text(strip=True)
-                ex_tag.decompose()
+            for ex_span in work.find_all("span", class_="h"):
+                ejemplo = ex_span.get_text(strip=True)
+                ex_span.decompose()
                 break
 
-            # Limpiar elementos que no son definición
-            for noise in p_clone.find_all(["span", "sup"],
-                                           class_=re.compile(r'n_acep|num_acep|marca|nbold')):
+            # Quitar elementos que ensucian el texto:
+            # - <span class="n_acep">: número de acepción ("1.")
+            # - <div class="c-definitions__item-footer">: sinónimos/antónimos
+            # - <abbr class="sin-header-inline">: etiquetas Sin./Ant.
+            for noise in work.find_all(class_=re.compile(
+                r'n_acep|c-definitions__item-footer|c-word-list|sin-header-inline|sin\b'
+            )):
                 noise.decompose()
 
-            # Obtener texto limpio
-            texto = p_clone.get_text(separator=" ", strip=True)
+            # También quitar <abbr> de categoría gramatical del texto (ya la guardamos)
+            for abbr in work.find_all("abbr", class_="d"):
+                abbr.decompose()
+
+            # Texto limpio
+            texto = work.get_text(separator=" ", strip=True)
             texto = re.sub(r'\s+', ' ', texto)
-            texto = re.sub(r'^\d+\.\s*', '', texto)   # quitar numeración residual
+            texto = re.sub(r'^\d+\.\s*', '', texto)  # quitar "1. " residual
             texto = texto.replace(" ,", ",").replace(" .", ".").strip()
 
             if texto and len(texto) > 3:
@@ -198,7 +194,7 @@ def scrape_rae(word: str) -> dict:
 
         if not defs:
             _save_debug(word, html)
-            return {"error": "párrafos vacíos tras limpieza (HTML guardado para debug)"}
+            return {"error": "definiciones vacías tras limpieza (HTML guardado para debug)"}
 
         return {"gram": gram, "defs": defs}
 
@@ -207,14 +203,13 @@ def scrape_rae(word: str) -> dict:
 
 
 def _save_debug(word: str, html: str):
-    """Guarda el HTML crudo para inspección cuando el scraping falla."""
     debug_path = OUTPUT_DIR / f"debug_{word.lower()}.html"
     debug_path.write_text(html, encoding="utf-8")
     print(f"[DEBUG] HTML guardado en {debug_path}")
 
 
 # ---------------------------------------------------------------------------
-# HELPERS CSV / ANKI
+# HELPERS
 # ---------------------------------------------------------------------------
 
 def build_anki_back(gram: str, defs: list) -> str:
@@ -230,13 +225,13 @@ def build_anki_back(gram: str, defs: list) -> str:
 
 def get_tag(gram: str) -> str:
     g = gram.lower() if gram else ""
-    if "sustantivo" in g or "sust" in g:
+    if "sustantivo" in g or "sust" in g or re.search(r'\bf\b|\bm\b', g):
         return "rae sustantivo"
-    if "verbo" in g:
+    if "verbo" in g or re.search(r'\btr\b|\bintr\b|\bprnl\b', g):
         return "rae verbo"
-    if "adjetivo" in g or "adj" in g:
+    if "adjetivo" in g or re.search(r'\badj\b', g):
         return "rae adjetivo"
-    if "adverbio" in g or "adv" in g:
+    if "adverbio" in g or re.search(r'\badv\b', g):
         return "rae adverbio"
     return "rae"
 
@@ -276,14 +271,12 @@ async def process_words(entries: list[WordEntry]):
         word = entry.word.strip()
         job_state["current_word"] = word
 
-        # Caché
         if word.lower() in cache:
             results.append(cache[word.lower()])
             job_state["done"] += 1
             print(f"[CACHE] {word}")
             continue
 
-        # Delay amable: 1.5–3 s aleatorio
         await asyncio.sleep(random.uniform(1.5, 3.0))
 
         data = scrape_rae(word)
@@ -314,7 +307,6 @@ async def process_words(entries: list[WordEntry]):
         results.append(row)
         job_state["done"] += 1
 
-    # Guardar CSV
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"anki_rae_{timestamp}.txt"
     (OUTPUT_DIR / filename).write_text(build_csv(results), encoding="utf-8")
@@ -372,10 +364,9 @@ async def resultado():
 
 @app.get("/debug/{word}")
 async def debug_html(word: str):
-    """Descarga el HTML crudo guardado cuando falla el scraping de una palabra."""
     debug_path = OUTPUT_DIR / f"debug_{word.lower()}.html"
     if not debug_path.exists():
-        raise HTTPException(404, f"No hay debug guardado para '{word}'. ¿Ya falló en el job?")
+        raise HTTPException(404, f"No hay debug guardado para '{word}'")
     content = debug_path.read_text(encoding="utf-8")
     return StreamingResponse(
         io.BytesIO(content.encode("utf-8")),
