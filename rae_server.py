@@ -127,7 +127,6 @@ def scrape_rae(word: str) -> dict:
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # --- 1. Buscar el <ol class="c-definitions"> principal ---
         ol = soup.find("ol", class_="c-definitions")
         if not ol:
             _save_debug(word, html)
@@ -136,61 +135,74 @@ def scrape_rae(word: str) -> dict:
         defs = []
         gram = ""
 
-        # --- 2. Iterar los <li class="j"> / <li class="j1"> / <li class="j2"> ---
-        # Clases de acepciones: j, j1, j2, j3 (principales), m (locuciones)
         li_items = ol.find_all("li", class_=re.compile(r'^[jm]\d*$'))
-
-        # Fallback: cualquier <li> con role="definition" o div.c-definitions__item
         if not li_items:
             li_items = ol.find_all("li")
 
         for i, li in enumerate(li_items[:3]):
-            # Buscar el div de contenido de la definición
             def_div = li.find("div", attrs={"role": "definition"})
             if not def_div:
                 def_div = li.find("div", class_="c-definitions__item")
             if not def_div:
-                def_div = li  # fallback: usar el li directamente
+                def_div = li
 
-            # Extraer categoría gramatical del primer ítem
-            # <abbr class="d" title="nombre femenino">f.</abbr>
             if i == 0:
                 abbr_gram = def_div.find("abbr", class_="d")
                 if abbr_gram:
                     gram = abbr_gram.get("title", abbr_gram.get_text(strip=True))
 
-            # Clonar para no mutilar el soup original
             work = BeautifulSoup(str(def_div), "html.parser")
 
-            # Extraer ejemplo antes de limpiar
-            # <span class="h"> = cursiva morada = ejemplo
+            # --- NUEVO: Extraer sinónimos y antónimos antes de limpiar ---
+            sinonimos = []
+            antonimos = []
+            footer = work.find("div", class_="c-definitions__item-footer")
+            if footer:
+                word_lists = footer.find_all("div", class_="c-word-list")
+                for wl in word_lists:
+                    label = wl.find("div", class_="c-word-list__label")
+                    if label:
+                        label_text = label.get_text(strip=True).lower()
+                        items = wl.find("ul", class_="c-word-list__items")
+                        if items:
+                            for li_item in items.find_all("li"):
+                                # Se añade separator=" " para evitar palabras pegadas
+                                li_text = li_item.get_text(separator=" ", strip=True).replace(" ,", ",").strip()
+                                if "sin" in label_text:
+                                    sinonimos.append(li_text)
+                                elif "ant" in label_text:
+                                    antonimos.append(li_text)
+            # -------------------------------------------------------------
+
+            # Extraer ejemplo (NUEVO: con separator=" " para arreglar los espacios faltantes)
             ejemplo = ""
             for ex_span in work.find_all("span", class_="h"):
-                ejemplo = ex_span.get_text(strip=True)
+                ejemplo = ex_span.get_text(separator=" ", strip=True)
                 ex_span.decompose()
                 break
 
-            # Quitar elementos que ensucian el texto:
-            # - <span class="n_acep">: número de acepción ("1.")
-            # - <div class="c-definitions__item-footer">: sinónimos/antónimos
-            # - <abbr class="sin-header-inline">: etiquetas Sin./Ant.
+            # Limpiar elementos ruidosos (ahora que ya extrajimos lo importante)
             for noise in work.find_all(class_=re.compile(
                 r'n_acep|c-definitions__item-footer|c-word-list|sin-header-inline|sin\b'
             )):
                 noise.decompose()
 
-            # También quitar <abbr> de categoría gramatical del texto (ya la guardamos)
             for abbr in work.find_all("abbr", class_="d"):
                 abbr.decompose()
 
-            # Texto limpio
+            # Texto de definición limpio
             texto = work.get_text(separator=" ", strip=True)
             texto = re.sub(r'\s+', ' ', texto)
-            texto = re.sub(r'^\d+\.\s*', '', texto)  # quitar "1. " residual
+            texto = re.sub(r'^\d+\.\s*', '', texto)  
             texto = texto.replace(" ,", ",").replace(" .", ".").strip()
 
             if texto and len(texto) > 3:
-                defs.append({"def": texto, "ex": ejemplo})
+                defs.append({
+                    "def": texto, 
+                    "ex": ejemplo,
+                    "sin": sinonimos,
+                    "ant": antonimos
+                })
 
         if not defs:
             _save_debug(word, html)
@@ -214,13 +226,36 @@ def _save_debug(word: str, html: str):
 
 def build_anki_back(gram: str, defs: list) -> str:
     parts = []
-    if gram:
-        parts.append(f"[{gram}]")
+    
     for i, d in enumerate(defs, 1):
-        parts.append(f"{i}. {d.get('def', '')}")
+        # Si hay más de una definición (como en Abalanzarse), enumerarlas para que quede ordenado
+        prefix = f"{i}. " if len(defs) > 1 else ""
+        
+        parts.append(f"{prefix}Definición:")
+        parts.append(d.get('def', ''))
+        
+        if d.get("sin"):
+            parts.append("Sinónimos o afines:")
+            for s in d["sin"]:
+                s_text = s.strip()
+                if not s_text.endswith('.'): s_text += '.'
+                parts.append(s_text)
+                
+        if d.get("ant"):
+            parts.append("Antónimos u opuestos:")
+            for a in d["ant"]:
+                a_text = a.strip()
+                if not a_text.endswith('.'): a_text += '.'
+                parts.append(a_text)
+                
         if d.get("ex"):
-            parts.append(f"   Ej: {d['ex']}")
-    return "\n".join(parts)
+            parts.append("Ejemplo:")
+            parts.append(d["ex"])
+            
+        # Añade una línea en blanco al final de cada bloque para separar múltiples acepciones
+        parts.append("")
+        
+    return "\n".join(parts).strip()
 
 
 def get_tag(gram: str) -> str:
